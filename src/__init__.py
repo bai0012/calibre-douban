@@ -24,10 +24,10 @@ DOUBAN_BOOK_CAT = "1001"
 DOUBAN_CONCURRENCY_SIZE = 5  # 并发查询数
 DOUBAN_DELAY_RANGE = (0.5, 1.5)
 DOUBAN_BOOK_URL_PATTERN = re.compile(".*/subject/(\\d+)/?")
-PROVIDER_NAME = "New Douban Books"
-PROVIDER_ID = "new_douban"
+PROVIDER_NAME = "New Douban Books Enhanced"
+PROVIDER_ID = "new_douban_enhanced"
 PROVIDER_VERSION = (3, 0, 0)
-PROVIDER_AUTHOR = 'bai0012'
+PROVIDER_AUTHOR = 'Gary Fu, modified by bai0012'
 
 
 class DoubanBookSearcher:
