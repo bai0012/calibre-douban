@@ -20,13 +20,15 @@ DOUBAN_BOOK_BASE = "https://book.douban.com/"
 DOUBAN_SEARCH_JSON_URL = "https://www.douban.com/j/search"
 DOUBAN_SEARCH_URL = "https://www.douban.com/search"
 DOUBAN_BOOK_URL = 'https://book.douban.com/subject/%s/'
+DOUBAN_ISBN_URL = 'https://book.douban.com/isbn/%s/'
 DOUBAN_BOOK_CAT = "1001"
 DOUBAN_CONCURRENCY_SIZE = 5  # 并发查询数
 DOUBAN_DELAY_RANGE = (0.5, 1.5)
 DOUBAN_BOOK_URL_PATTERN = re.compile(".*/subject/(\\d+)/?")
 PROVIDER_NAME = "New Douban Books Enhanced"
 PROVIDER_ID = "new_douban_enhanced"
-PROVIDER_VERSION = (3, 0, 0)
+PROVIDER_LEGACY_IDS = ('new_douban', 'douban')
+PROVIDER_VERSION = (3, 0, 1)
 PROVIDER_AUTHOR = 'Gary Fu, modified by bai0012'
 
 
@@ -39,6 +41,8 @@ class DoubanBookSearcher:
         self.douban_delay_enable = douban_delay_enable
         self.douban_debug_enable = bool(douban_debug_enable)
         self.douban_login_cookie = self.normalize_login_cookie(douban_login_cookie)
+        self.access_challenge_detected = False
+        self.user_agent = random_user_agent()
 
     def debug(self, log, message):
         if self.douban_debug_enable:
@@ -126,6 +130,7 @@ class DoubanBookSearcher:
             return None
 
     def load_book_urls_new(self, query, log, timeout=30):
+        self.access_challenge_detected = False
         params = {"cat": DOUBAN_BOOK_CAT, "q": query}
         url = DOUBAN_SEARCH_URL + "?" + urlencode(params)
         log.info(f'Load books by search url: {url}')
@@ -176,13 +181,14 @@ class DoubanBookSearcher:
             self.random_sleep(log)
         res = self.open_url(url, log, timeout=timeout)
         if res is not None and res.status in [200, 201]:
+            final_url = res.geturl()
             book_detail_content = self.get_res_content(res)
-            self.debug(log, f'Book page html length: {len(book_detail_content)}, url: {url}')
+            self.debug(log, f'Book page html length: {len(book_detail_content)}, url: {url}, final_url: {final_url}')
             if self.is_prohibited(book_detail_content, log):
                 return
-            log.info("Downloaded:{} Successful,Time {:.0f}ms".format(url, (time.time() - start_time) * 1000))
+            log.info("Downloaded:{} Successful,Time {:.0f}ms".format(final_url, (time.time() - start_time) * 1000))
             try:
-                book = self.book_parser.parse_book(url, book_detail_content)
+                book = self.book_parser.parse_book(final_url, book_detail_content)
                 if not self.is_valid_book(book):
                     log.info(f"Parse book content error: title not found, url: {url}")
                     self.debug(log, f"Parse book content: {book_detail_content[:2000]}")
@@ -195,15 +201,28 @@ class DoubanBookSearcher:
             self.debug(log, f'Book request returned unexpected status: {res.status}, url: {url}')
         return book
 
+    def load_book_by_isbn(self, isbn, log, timeout=30):
+        if not isbn:
+            return None
+        isbn_url = DOUBAN_ISBN_URL % isbn
+        self.debug(log, f'Load book by isbn url before search: {isbn_url}')
+        return self.load_book(isbn_url, log, timeout=timeout)
+
     def is_valid_book(self, book):
         return book is not None and book.get('title', None)
 
     def is_prohibited(self, html_content, log):
-        prohibited = html_content is not None and '<title>禁止访问</title>' in html_content
+        prohibited = html_content is not None and (
+            '<title>禁止访问</title>' in html_content or
+            'TencentCaptcha' in html_content or
+            '你访问豆瓣的方式有点像机器人程序' in html_content
+        )
         if prohibited:
+            self.access_challenge_detected = True
             html = BeautifulSoup(html_content)
             html_content = html.select_one('div#content')
-            log.info(f'Douban网页访问失败：{html_content}')
+            log.info('Douban网页访问失败：检测到豆瓣人机验证或访问限制。请在同一登录账号的浏览器中完成验证后重试。')
+            self.debug(log, f'Douban access challenge content: {html_content}')
         return prohibited
 
     def get_res_content(self, res):
@@ -216,7 +235,13 @@ class DoubanBookSearcher:
         return res_content.decode(charset, errors='replace')
 
     def get_headers(self):
-        headers = {'User-Agent': random_user_agent(), 'Accept-Encoding': 'gzip, deflate'}
+        headers = {
+            'User-Agent': self.user_agent,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+        }
         if self.douban_login_cookie:
             headers['Cookie'] = self.douban_login_cookie
         return headers
@@ -413,11 +438,21 @@ class NewDoubanBooks(Source):
         return max(1, concurrency_size)
 
     def get_book_url(self, identifiers):  # {{{
-        douban_id = identifiers.get(PROVIDER_ID, None)
-        if douban_id is None:
-            douban_id = identifiers.get('douban', None)
-        if douban_id is not None:
-            return PROVIDER_ID, douban_id, DOUBAN_BOOK_URL % douban_id
+        for identifier_name in (PROVIDER_ID,) + PROVIDER_LEGACY_IDS:
+            douban_id = self.extract_douban_id(identifiers.get(identifier_name, None))
+            if douban_id is not None:
+                return identifier_name, douban_id, DOUBAN_BOOK_URL % douban_id
+
+    def extract_douban_id(self, identifier_value):
+        if not identifier_value:
+            return None
+        identifier_value = str(identifier_value).strip()
+        url_match = DOUBAN_BOOK_URL_PATTERN.match(identifier_value)
+        if url_match:
+            return url_match.group(1)
+        if identifier_value.isdigit():
+            return identifier_value
+        return None
 
     def download_cover(
             self,
@@ -483,7 +518,11 @@ class NewDoubanBooks(Source):
 
     def get_cached_cover_url(self, identifiers):  # {{{
         url = None
-        db = identifiers.get(PROVIDER_ID, None)
+        db = None
+        for identifier_name in (PROVIDER_ID,) + PROVIDER_LEGACY_IDS:
+            db = self.extract_douban_id(identifiers.get(identifier_name, None))
+            if db is not None:
+                break
         if db is None:
             isbn = identifiers.get('isbn', None)
             if isbn is not None:
@@ -512,22 +551,40 @@ class NewDoubanBooks(Source):
         ))
         if new_douban:
             # 如果有new_douban的id，直接精确获取数据
-            log.info(f'Load book by {PROVIDER_ID}:{new_douban[1]}')
+            log.info(f'Load book by {new_douban[0]}:{new_douban[1]}')
             book = self.book_searcher.load_book(new_douban[2], log, timeout=timeout)
             books = []
             if self.book_searcher.is_valid_book(book):
                 books.append(book)
             self.debug(log, f'Loaded by identifier, valid books: {len(books)}')
         else:
-            search_keyword = title
-            if self.douban_search_with_author and title and authors:
-                authors_str = ','.join(authors)
-                search_keyword = f'{title} {authors_str}'
-            self.debug(log, f'Primary search keyword: {isbn or search_keyword!r}')
-            books = self.book_searcher.search_books(isbn or search_keyword, log, timeout=timeout)
-            if not len(books) and title and (isbn or search_keyword != title):
-                self.debug(log, f'Fallback search keyword: {title!r}')
-                books = self.book_searcher.search_books(title, log, timeout=timeout)  # 用isbn或者title+auther没有数据，用title重新搜一遍
+            books = []
+            if isbn:
+                book = self.book_searcher.load_book_by_isbn(isbn, log, timeout=timeout)
+                if self.book_searcher.is_valid_book(book):
+                    books.append(book)
+                self.debug(log, f'Loaded by ISBN url, valid books: {len(books)}')
+                if self.book_searcher.access_challenge_detected:
+                    self.debug(log, 'Skip search because Douban access challenge was detected on ISBN url')
+                    return
+            if books:
+                self.debug(log, 'Skip search because ISBN url returned a valid book')
+            else:
+                search_keyword = title
+                if self.douban_search_with_author and title and authors:
+                    authors_str = ','.join(authors)
+                    search_keyword = f'{title} {authors_str}'
+                self.debug(log, f'Primary search keyword: {isbn or search_keyword!r}')
+                books = self.book_searcher.search_books(isbn or search_keyword, log, timeout=timeout)
+                if self.book_searcher.access_challenge_detected:
+                    self.debug(log, 'Skip fallback search because Douban access challenge was detected')
+                    return
+                if not len(books) and title and (isbn or search_keyword != title):
+                    self.debug(log, f'Fallback search keyword: {title!r}')
+                    books = self.book_searcher.search_books(title, log, timeout=timeout)  # 用isbn或者title+auther没有数据，用title重新搜一遍
+                    if self.book_searcher.access_challenge_detected:
+                        self.debug(log, 'Stop identify because Douban access challenge was detected')
+                        return
         self.debug(log, f'identify produced {len(books)} book candidate(s)')
         for book in books:
             ans = self.to_metadata(book, add_translator_to_author, log)
