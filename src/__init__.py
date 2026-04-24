@@ -1,3 +1,4 @@
+import os
 import re
 import time
 import random
@@ -25,18 +26,79 @@ DOUBAN_DELAY_RANGE = (0.5, 1.5)
 DOUBAN_BOOK_URL_PATTERN = re.compile(".*/subject/(\\d+)/?")
 PROVIDER_NAME = "New Douban Books"
 PROVIDER_ID = "new_douban"
-PROVIDER_VERSION = (2, 3, 0)
-PROVIDER_AUTHOR = 'Gary Fu'
+PROVIDER_VERSION = (3, 0, 0)
+PROVIDER_AUTHOR = 'bai0012'
 
 
 class DoubanBookSearcher:
 
-    def __init__(self, max_workers, douban_delay_enable, douban_login_cookie):
+    def __init__(self, max_workers, douban_delay_enable, douban_login_cookie, douban_debug_enable=False):
         self.book_parser = DoubanBookHtmlParser()
         self.max_workers = max_workers
         self.thread_pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='douban_async')
         self.douban_delay_enable = douban_delay_enable
-        self.douban_login_cookie = douban_login_cookie
+        self.douban_debug_enable = bool(douban_debug_enable)
+        self.douban_login_cookie = self.normalize_login_cookie(douban_login_cookie)
+
+    def debug(self, log, message):
+        if self.douban_debug_enable:
+            log.info(f'[douban-debug] {message}')
+
+    def normalize_login_cookie(self, cookie_text):
+        if not cookie_text:
+            return None
+        cookie_text = str(cookie_text).strip()
+        if not cookie_text:
+            return None
+        cookie_text = self.load_cookie_text(cookie_text)
+        netscape_cookie = self.parse_netscape_cookie(cookie_text)
+        if netscape_cookie:
+            return netscape_cookie
+        if cookie_text.lower().startswith('cookie:'):
+            cookie_text = cookie_text.split(':', 1)[1].strip()
+        return '; '.join(line.strip() for line in cookie_text.splitlines() if line.strip())
+
+    def load_cookie_text(self, cookie_text):
+        if '\n' in cookie_text or '\r' in cookie_text:
+            return cookie_text
+        cookie_path = os.path.expandvars(os.path.expanduser(cookie_text))
+        try:
+            if os.path.isfile(cookie_path):
+                with open(cookie_path, 'r', encoding='utf-8') as cookie_file:
+                    return cookie_file.read()
+        except OSError:
+            pass
+        return cookie_text
+
+    def parse_netscape_cookie(self, cookie_text):
+        cookies = {}
+        now = int(time.time())
+        for line in cookie_text.splitlines():
+            line = line.strip()
+            if not line or (line.startswith('#') and not line.startswith('#HttpOnly_')):
+                continue
+            parts = line.split('\t')
+            if len(parts) != 7:
+                parts = line.split(None, 6)
+            if len(parts) != 7:
+                continue
+            domain, _, _, _, expires, name, value = parts
+            if domain.startswith('#HttpOnly_'):
+                domain = domain[len('#HttpOnly_'):]
+            domain = domain.lower()
+            normalized_domain = domain.lstrip('.')
+            if normalized_domain != 'douban.com' and not normalized_domain.endswith('.douban.com'):
+                continue
+            try:
+                expires_at = int(expires)
+            except ValueError:
+                expires_at = 0
+            if expires_at and expires_at < now:
+                continue
+            cookies[name] = value
+        if cookies:
+            return '; '.join(f'{name}={value}' for name, value in cookies.items())
+        return None
 
     def calc_url(self, href, log=None):
         if not href:
@@ -48,11 +110,17 @@ class DoubanBookSearcher:
         if DOUBAN_BOOK_URL_PATTERN.match(url):
             return url
         if log:
-            log.info(f'Ignored non-book search result url: {href}')
+            self.debug(log, f'Ignored non-book search result url: {href}')
 
     def open_url(self, url, log, timeout=30):
         try:
-            return urlopen(Request(url, headers=self.get_headers(), method='GET'), timeout=timeout)
+            start_time = time.time()
+            self.debug(log, f'Opening url: {url}, timeout={timeout}, cookie_enabled={bool(self.douban_login_cookie)}')
+            res = urlopen(Request(url, headers=self.get_headers(), method='GET'), timeout=timeout)
+            self.debug(log, 'Response status: {}, url: {}, time={:.0f}ms'.format(
+                getattr(res, 'status', None), url, (time.time() - start_time) * 1000
+            ))
+            return res
         except Exception as e:
             log.info(f'Download failed: {url}, error: {e}')
             return None
@@ -65,22 +133,29 @@ class DoubanBookSearcher:
         book_urls = []
         if res is not None and res.status in [200, 201]:
             html_content = self.get_res_content(res)
+            self.debug(log, f'Search page html length: {len(html_content)}')
             if self.is_prohibited(html_content, log):
                 return book_urls
             html = BeautifulSoup(html_content)
             alist = html.select('a.nbg')
+            self.debug(log, f'Search result link count: {len(alist)}')
             for link in alist:
                 href = link.get('href', '')
                 parsed = self.calc_url(href, log)
                 if parsed:
                     if len(book_urls) < self.max_workers:
                         book_urls.append(parsed)
+            self.debug(log, f'Parsed book urls: {book_urls}')
+        elif res is not None:
+            self.debug(log, f'Search request returned unexpected status: {res.status}')
         return book_urls
 
     def search_books(self, query, log, timeout=30):
         if not query:
+            self.debug(log, 'Skip empty search query')
             return []
         book_urls = self.load_book_urls_new(query, log, timeout=timeout)
+        self.debug(log, f'Search query "{query}" produced {len(book_urls)} book url(s)')
         books = []
         futures = [self.thread_pool.submit(self.load_book, book_url, log, timeout) for book_url in book_urls]
         for future in as_completed(futures):
@@ -91,6 +166,7 @@ class DoubanBookSearcher:
                 continue
             if self.is_valid_book(book):
                 books.append(book)
+        self.debug(log, f'Search query "{query}" produced {len(books)} valid book(s)')
         return books
 
     def load_book(self, url, log, timeout=30):
@@ -101,15 +177,22 @@ class DoubanBookSearcher:
         res = self.open_url(url, log, timeout=timeout)
         if res is not None and res.status in [200, 201]:
             book_detail_content = self.get_res_content(res)
+            self.debug(log, f'Book page html length: {len(book_detail_content)}, url: {url}')
             if self.is_prohibited(book_detail_content, log):
                 return
             log.info("Downloaded:{} Successful,Time {:.0f}ms".format(url, (time.time() - start_time) * 1000))
             try:
                 book = self.book_parser.parse_book(url, book_detail_content)
                 if not self.is_valid_book(book):
-                    log.info(f"Parse book content error: {book_detail_content}")
+                    log.info(f"Parse book content error: title not found, url: {url}")
+                    self.debug(log, f"Parse book content: {book_detail_content[:2000]}")
+                else:
+                    self.debug(log, f"Parsed book fields: {sorted(book.keys())}, id={book.get('id')}")
             except Exception as e:
-                log.info(f"Parse book content error: {e} \n Content: {book_detail_content}")
+                log.info(f"Parse book content error: {e}, url: {url}")
+                self.debug(log, f"Parse book content: {book_detail_content[:2000]}")
+        elif res is not None:
+            self.debug(log, f'Book request returned unexpected status: {res.status}, url: {url}')
         return book
 
     def is_valid_book(self, book):
@@ -296,9 +379,14 @@ class NewDoubanBooks(Source):
             _('add authors to search keywords')
         ),
         Option(
+            'douban_debug_enable', 'bool', False,
+            _('douban debug logging'),
+            _('Output detailed logs for troubleshooting Douban metadata download')
+        ),
+        Option(
             'douban_login_cookie', 'string', None,
             _('douban login cookie'),
-            _('Browser cookie after login')
+            _('Browser Cookie header, Netscape cookie text, or Netscape cookie file path after login')
         ),
     )
 
@@ -306,9 +394,16 @@ class NewDoubanBooks(Source):
         Source.__init__(self, *args, **kwargs)
         concurrency_size = self.get_concurrency_size()
         douban_delay_enable = bool(self.prefs.get('douban_delay_enable'))
+        self.douban_debug_enable = bool(self.prefs.get('douban_debug_enable'))
         douban_login_cookie = self.prefs.get('douban_login_cookie')
         self.douban_search_with_author = bool(self.prefs.get('douban_search_with_author'))
-        self.book_searcher = DoubanBookSearcher(concurrency_size, douban_delay_enable, douban_login_cookie)
+        self.book_searcher = DoubanBookSearcher(
+            concurrency_size, douban_delay_enable, douban_login_cookie, self.douban_debug_enable
+        )
+
+    def debug(self, log, message):
+        if self.douban_debug_enable:
+            log.info(f'[douban-debug] {message}')
 
     def get_concurrency_size(self):
         try:
@@ -334,7 +429,11 @@ class NewDoubanBooks(Source):
             identifiers={},
             timeout=30,
             get_best_cover=False):
+        self.debug(log, 'download_cover title={!r}, authors={!r}, identifiers={}, timeout={}, get_best_cover={}'.format(
+            title, authors, identifiers, timeout, get_best_cover
+        ))
         cached_url = self.get_cached_cover_url(identifiers)
+        self.debug(log, f'Initial cached cover url: {cached_url}')
         if cached_url is None:
             log.info('No cached cover found, running identify')
             rq = Queue()
@@ -363,6 +462,7 @@ class NewDoubanBooks(Source):
                 cached_url = self.get_cached_cover_url(mi.identifiers)
                 if cached_url is not None:
                     break
+            self.debug(log, f'Cover url after identify: {cached_url}')
         if cached_url is None:
             log.info('No cover found')
             return
@@ -372,9 +472,11 @@ class NewDoubanBooks(Source):
             if self.book_searcher.douban_login_cookie:
                 br = br.clone_browser()
                 br.set_current_header('Cookie', self.book_searcher.douban_login_cookie)
+                self.debug(log, 'Using configured Douban login cookie for cover request')
             br.set_current_header('Referer', DOUBAN_BOOK_BASE)
             cdata = br.open_novisit(cached_url, timeout=timeout).read()
             if cdata:
+                self.debug(log, f'Downloaded cover bytes: {len(cdata)}')
                 result_queue.put((self, cdata))
         except:
             log.exception('Failed to download cover from:', cached_url)
@@ -405,6 +507,9 @@ class NewDoubanBooks(Source):
 
         isbn = check_isbn(identifiers.get('isbn', None))
         new_douban = self.get_book_url(identifiers)
+        self.debug(log, 'identify title={!r}, authors={!r}, identifiers={}, isbn={!r}, timeout={}, cookie_enabled={}'.format(
+            title, authors, identifiers, isbn, timeout, bool(self.book_searcher.douban_login_cookie)
+        ))
         if new_douban:
             # 如果有new_douban的id，直接精确获取数据
             log.info(f'Load book by {PROVIDER_ID}:{new_douban[1]}')
@@ -412,14 +517,18 @@ class NewDoubanBooks(Source):
             books = []
             if self.book_searcher.is_valid_book(book):
                 books.append(book)
+            self.debug(log, f'Loaded by identifier, valid books: {len(books)}')
         else:
             search_keyword = title
             if self.douban_search_with_author and title and authors:
                 authors_str = ','.join(authors)
                 search_keyword = f'{title} {authors_str}'
+            self.debug(log, f'Primary search keyword: {isbn or search_keyword!r}')
             books = self.book_searcher.search_books(isbn or search_keyword, log, timeout=timeout)
             if not len(books) and title and (isbn or search_keyword != title):
+                self.debug(log, f'Fallback search keyword: {title!r}')
                 books = self.book_searcher.search_books(title, log, timeout=timeout)  # 用isbn或者title+auther没有数据，用title重新搜一遍
+        self.debug(log, f'identify produced {len(books)} book candidate(s)')
         for book in books:
             ans = self.to_metadata(book, add_translator_to_author, log)
             if isinstance(ans, Metadata):
@@ -429,6 +538,7 @@ class NewDoubanBooks(Source):
                 if ans.cover:
                     self.cache_identifier_to_cover_url(db, ans.cover)
                 self.clean_downloaded_metadata(ans)
+                self.debug(log, f'Queue metadata title={ans.title!r}, identifiers={ans.identifiers}, cover={bool(ans.cover)}')
                 result_queue.put(ans)
 
     def to_metadata(self, book, add_translator_to_author, log):
@@ -456,7 +566,7 @@ class NewDoubanBooks(Source):
             mi.isbn = book.get('isbn', '')
             mi.series = book.get('series', '')
             mi.language = book.get('language', 'zh_CN')
-            log.info('parsed book', book)
+            self.debug(log, f'parsed book: {book}')
             return mi
 
 
