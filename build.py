@@ -6,9 +6,12 @@ import zipfile
 def zip_dir(input_path, output_file):
     output_zip = zipfile.ZipFile(output_file, "w", zipfile.ZIP_DEFLATED)
     for path, dir_names, file_names in os.walk(input_path):
+        dir_names[:] = [dirname for dirname in dir_names if dirname != "__pycache__"]
         # 原路径修复: ./src/test -> /test
         parsed_path = path.replace(input_path, '')
         for filename in file_names:
+            if filename.endswith((".pyc", ".pyo")):
+                continue
             full_path = os.path.join(path, filename)
             print('zip adding file %s' % full_path)
             # 文件路径，压缩路径
