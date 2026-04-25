@@ -28,13 +28,19 @@ DOUBAN_BOOK_URL_PATTERN = re.compile(".*/subject/(\\d+)/?")
 PROVIDER_NAME = "New Douban Books"
 PROVIDER_ID = "new_douban"
 PROVIDER_LEGACY_IDS = ('new_douban', 'douban')
-PROVIDER_VERSION = (3, 0, 1)
+PROVIDER_VERSION = (3, 0, 2)
 PROVIDER_AUTHOR = 'Gary Fu, modified by bai0012'
 
 
 class DoubanBookSearcher:
 
-    def __init__(self, max_workers, douban_delay_enable, douban_login_cookie, douban_debug_enable=False):
+    def __init__(
+            self,
+            max_workers,
+            douban_delay_enable,
+            douban_login_cookie,
+            douban_debug_enable=False,
+            douban_user_agent=None):
         self.book_parser = DoubanBookHtmlParser()
         self.max_workers = max_workers
         self.thread_pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='douban_async')
@@ -42,7 +48,11 @@ class DoubanBookSearcher:
         self.douban_debug_enable = bool(douban_debug_enable)
         self.douban_login_cookie = self.normalize_login_cookie(douban_login_cookie)
         self.access_challenge_detected = False
-        self.user_agent = random_user_agent()
+        self.user_agent = self.normalize_user_agent(douban_user_agent)
+
+    def normalize_user_agent(self, user_agent):
+        user_agent = str(user_agent or '').strip()
+        return user_agent or random_user_agent()
 
     def debug(self, log, message):
         if self.douban_debug_enable:
@@ -119,7 +129,12 @@ class DoubanBookSearcher:
     def open_url(self, url, log, timeout=30):
         try:
             start_time = time.time()
-            self.debug(log, f'Opening url: {url}, timeout={timeout}, cookie_enabled={bool(self.douban_login_cookie)}')
+            self.debug(
+                log,
+                'Opening url: {}, timeout={}, cookie_enabled={}, user_agent_len={}'.format(
+                    url, timeout, bool(self.douban_login_cookie), len(self.user_agent)
+                )
+            )
             res = urlopen(Request(url, headers=self.get_headers(), method='GET'), timeout=timeout)
             self.debug(log, 'Response status: {}, url: {}, time={:.0f}ms'.format(
                 getattr(res, 'status', None), url, (time.time() - start_time) * 1000
@@ -409,6 +424,11 @@ class NewDoubanBooks(Source):
             _('Output detailed logs for troubleshooting Douban metadata download')
         ),
         Option(
+            'douban_user_agent', 'string', None,
+            _('douban user agent'),
+            _('Custom browser User-Agent for Douban requests. Leave empty to use calibre default random User-Agent.')
+        ),
+        Option(
             'douban_login_cookie', 'string', None,
             _('douban login cookie'),
             _('Browser Cookie header, Netscape cookie text, or Netscape cookie file path after login')
@@ -421,10 +441,16 @@ class NewDoubanBooks(Source):
         douban_delay_enable = bool(self.prefs.get('douban_delay_enable'))
         self.douban_debug_enable = bool(self.prefs.get('douban_debug_enable'))
         douban_login_cookie = self.prefs.get('douban_login_cookie')
+        douban_user_agent = self.prefs.get('douban_user_agent')
         self.douban_search_with_author = bool(self.prefs.get('douban_search_with_author'))
         self.book_searcher = DoubanBookSearcher(
-            concurrency_size, douban_delay_enable, douban_login_cookie, self.douban_debug_enable
+            concurrency_size,
+            douban_delay_enable,
+            douban_login_cookie,
+            self.douban_debug_enable,
+            douban_user_agent
         )
+        self.douban_custom_user_agent_enabled = bool(str(douban_user_agent or '').strip())
 
     def debug(self, log, message):
         if self.douban_debug_enable:
@@ -548,6 +574,12 @@ class NewDoubanBooks(Source):
         new_douban = self.get_book_url(identifiers)
         self.debug(log, 'identify title={!r}, authors={!r}, identifiers={}, isbn={!r}, timeout={}, cookie_enabled={}'.format(
             title, authors, identifiers, isbn, timeout, bool(self.book_searcher.douban_login_cookie)
+        ))
+        self.debug(log, 'request profile concurrency={}, delay_enabled={}, custom_user_agent={}, user_agent_len={}'.format(
+            self.book_searcher.max_workers,
+            self.book_searcher.douban_delay_enable,
+            self.douban_custom_user_agent_enabled,
+            len(self.book_searcher.user_agent)
         ))
         if new_douban:
             # 如果有new_douban的id，直接精确获取数据
